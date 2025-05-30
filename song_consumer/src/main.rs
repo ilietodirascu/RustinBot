@@ -6,11 +6,8 @@ use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, Consumer,
 };
 use models::{ConvertResponse, RabbitMessage, Tomp3Response, YouTubeResponse};
-use reqwest::{
-    cookie::{CookieStore, Jar},
-    Client,
-};
-use std::{env, error::Error, sync::Arc};
+use reqwest::Client;
+use std::{env, error::Error};
 use urlencoding::encode;
 
 mod models;
@@ -22,7 +19,6 @@ async fn main() -> Result<(), DynError> {
     pretty_env_logger::init();
     dotenv().expect("Failed to load .env file");
     log::info!("Application started");
-
     let rabbit_addr = env::var("RABBIT_ADDRESS")?;
     let google_api_key = env::var("GOOGLE_VISION_API_KEY")?;
 
@@ -68,37 +64,38 @@ async fn main() -> Result<(), DynError> {
 }
 
 async fn process_songs(text: String, google_api_key: &str) -> Result<Vec<String>, DynError> {
-    let cookie_jar = Arc::new(Jar::default());
-    let mp3_client = Client::builder()
-        .cookie_provider(cookie_jar) // Attach the cookie jar only for mp3 API requests
-        .build()?;
-    let general_client = Client::new(); // General client for other requests
+    // Create a client for both YouTube and MP3 requests
+    let client = Client::new();
 
+    // Split the input text into individual song lines
     let songs: Vec<&str> = text.lines().collect();
     let mut tasks = Vec::new();
 
     for song in songs {
-        let mp3_client = mp3_client.clone();
-        let general_client = general_client.clone();
+        let client = client.clone();
         let api_key = google_api_key.to_string();
         let song = song.to_string();
 
+        // Spawn tasks to process each song concurrently
         let task = tokio::spawn(async move {
             log::info!("Processing song: {}", song);
 
-            let video_id = search_youtube(&general_client, &api_key, &song)
+            // Search for the song on YouTube
+            let video_id = search_youtube(&client, &api_key, &song)
                 .await?
                 .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("No video found"))?;
 
             log::info!("Using video ID: {}", video_id);
 
-            let k = get_tomp3_k(&mp3_client, &video_id)
+            // Get the `k` parameter for the video ID from the mp3 API
+            let k = get_tomp3_k(&client, &video_id)
                 .await?
                 .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("Failed to get k parameter"))?;
 
             log::info!("Retrieved k parameter for video ID: {}", video_id);
 
-            let dlink = convert_to_mp3(&mp3_client, &video_id, &k)
+            // Convert the video to mp3 and retrieve the download link
+            let dlink = convert_to_mp3(&client, &video_id, &k)
                 .await?
                 .ok_or_else(|| {
                     Box::<dyn Error + Send + Sync>::from("Failed to get download link")
@@ -106,16 +103,18 @@ async fn process_songs(text: String, google_api_key: &str) -> Result<Vec<String>
 
             log::info!("Retrieved download link: {}", dlink);
 
-            // Return the formatted link with song name
+            // Format the song with the download link
             Ok::<String, DynError>(format!("🎵 *{}*\n🔗 {}", song, dlink))
         });
 
         tasks.push(task);
     }
 
+    // Wait for all tasks to complete and collect the results
     let results = join_all(tasks).await;
     let mut links = Vec::new();
 
+    // Process the results
     for (index, result) in results.into_iter().enumerate() {
         match result {
             Ok(Ok(link)) => links.push(format!("{}. {}", index + 1, link)),
@@ -134,24 +133,30 @@ async fn search_youtube(
 ) -> Result<Option<String>, DynError> {
     let encoded_query = encode(query);
     let url = format!(
-        "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&order=viewCount&maxResults=1&q={}&key={}",
+        "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=5&q={}&key={}",
         encoded_query, api_key
     );
 
     log::info!("Searching YouTube with query: {}", query);
     let response: YouTubeResponse = client.get(&url).send().await?.json().await?;
-    Ok(response
-        .items
-        .into_iter()
-        .next()
-        .map(|item| item.id.videoId))
-}
 
-fn log_cookies(cookie_jar: &Arc<Jar>, url: &str) {
-    let cookies = cookie_jar.cookies(&url.parse().unwrap());
-    match cookies {
-        Some(cookie) => log::info!("Attached cookies for {}: {:#?}", url, cookie),
-        None => log::info!("No cookies attached for {}", url),
+    // Borrow the vector instead of moving it
+    let best_match = response.items.iter().find(|item| {
+        let title = item.snippet.title.to_lowercase();
+        let search_query = query.to_lowercase();
+        title.contains(&search_query) || search_query.contains(&title)
+    });
+
+    if let Some(item) = best_match {
+        log::info!("Found best match with title: {}", item.snippet.title);
+        Ok(Some(item.id.videoId.clone())) // Clone the video ID
+    } else {
+        log::warn!("No exact match found, using the first result");
+        Ok(response
+            .items
+            .into_iter()
+            .next()
+            .map(|item| item.id.videoId))
     }
 }
 
@@ -166,8 +171,13 @@ async fn get_tomp3_k(client: &Client, video_id: &str) -> Result<Option<String>, 
     ];
 
     log::info!("Retrieving k parameter for video ID: {}", video_id);
-
-    let response = client.post(url).form(&params).header("Cookie", "cf_clearance=nfBjEpAsDIH9gI2YRAWoVSkMrAyeiF2ArPYV9WMQop4-1723801695-1.0.1.1-C8QFuaiYCUF9A6Rz8LXox1TOt.xvGErsl_Is71Wyof3mkIu3RbEHxiIOO5z8icN05BoEAaPvkntWZRxWVAXFEw; _ga_JRWV2N11YN=GS1.1.1723801702.1.1.1723801732.0.0.0; _ga=GA1.1.1396507687.1723801703").send().await?;
+    let cookie = env::var("CLOUD_FLARE_COOKIE")?;
+    let response = client
+    .post(url)
+    .form(&params)
+    .header("Referer", "https://tomp3.cc/")
+    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.75 Safari/537.36")
+    .header("Cookie", cookie).send().await?;
 
     let status = response.status();
     let text = response.text().await?;

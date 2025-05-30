@@ -48,6 +48,8 @@ pub async fn receive_message(
                 handle_help_command(chat_id, &channel_pool).await?;
             } else if text.starts_with("/songlinks") {
                 handle_songlinks(chat_id, text, &channel_pool).await?;
+            } else if text.starts_with("/donate") {
+                handle_donate(chat_id, &channel_pool).await?;
             }
         }
     } else {
@@ -91,6 +93,15 @@ async fn handle_readimage(
         info!("No valid file_id found in the photo.");
         Err(StatusCode::BAD_REQUEST)
     }
+}
+async fn handle_donate(chat_id: i64, channel_pool: &Arc<ChannelPool>) -> Result<(), StatusCode> {
+    let help_message = RabbitMessage {
+        chat_id,
+        text: "donate request".to_string(),
+    };
+    publish_to_queue("Donate", help_message, channel_pool).await?;
+    info!("Published '/donate' message to Donate queue.");
+    Ok(())
 }
 
 // Handle the /help command by sending a help message to the Reply queue
